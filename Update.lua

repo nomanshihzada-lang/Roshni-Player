@@ -1,0 +1,981 @@
+require "import"
+import "android.app.*"
+import "android.os.*"
+import "android.widget.*"
+import "android.view.*"
+import "android.content.*"
+import "android.media.*"
+import "android.provider.*"
+import "android.net.*"
+import "android.text.*"
+import "java.io.File"
+
+-- ============================================================
+--  APP INFO
+-- ============================================================
+local APP_NAME    = "Roshni Player"
+local APP_VERSION = "1.1"
+local DEV_NAME    = "Developed by Bridge Tech Welfare"
+local CREATED_BY  = "Project by CH Abdul Rafay"
+
+local WA_CHANNEL_URL   = "https://whatsapp.com/channel/0029VbCJfWSAojYuaMuB9E1t"
+local WA_COMMUNITY_URL = "https://chat.whatsapp.com/CDkyuCcPVyEIAkW87j644n"
+local YOUTUBE_URL      = "https://youtube.com/@instructor-of-btw?si=IFh27qGn8z44985D"
+local APP_EMAIL        = "bridgetechwelfare@gmail.com"
+local FEEDBACK_NUMBER  = "923057040811"
+
+local APP_DESCRIPTION =
+  "Roshni Player is a free and easy-to-use audio and video player app. " ..
+  "It allows you to play any audio or video file from your device with advanced " ..
+  "features like playback speed control (0.5x to 4x), quick rewind and forward, " ..
+  "single file loop, and background playback. You can customize the skip duration " ..
+  "and enjoy smooth playback without any interruptions. The app is designed with " ..
+  "simplicity in mind, making it suitable for everyone."
+
+-- ============================================================
+--  CONTEXT & PREFS
+-- ============================================================
+local ctx = activity or service or this
+if not ctx then
+  local ActivityThread = luajava.bindClass("android.app.ActivityThread")
+  ctx = ActivityThread.currentApplication().getApplicationContext()
+end
+
+local prefs = ctx.getSharedPreferences("BridgePlayPrefs", Context.MODE_PRIVATE)
+
+local skipDuration   = prefs.getInt("skipDuration", 10000)
+local playbackSpeed  = prefs.getFloat("playbackSpeed", 1.0)
+local singleLoop     = prefs.getBoolean("singleLoop", false)
+local backgroundPlay = prefs.getBoolean("backgroundPlay", false)
+local currentFileType= prefs.getString("currentFileType", "")
+
+-- ============================================================
+--  MEDIA PLAYER
+-- ============================================================
+if not _G.GlobalMediaPlayer then
+  _G.GlobalMediaPlayer = MediaPlayer()
+end
+local mediaPlayer = _G.GlobalMediaPlayer
+
+local isPlaying        = false
+local videoMediaPlayer = nil
+
+-- ============================================================
+--  HELPERS
+-- ============================================================
+local function formatDuration(ms)
+  if not ms or ms <= 0 then return "00:00" end
+  local s = math.floor(ms / 1000)
+  return string.format("%02d:%02d", math.floor(s/60), s % 60)
+end
+
+local function showSafeDialog(dialogOrBuilder)
+  local dlg
+  if dialogOrBuilder.create then dlg = dialogOrBuilder.create() else dlg = dialogOrBuilder end
+  if not activity then
+    pcall(function()
+      local wt = WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+      if Build.VERSION.SDK_INT >= 26 then wt = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY end
+      dlg.getWindow().setType(wt)
+    end)
+  end
+  dlg.show()
+  return dlg
+end
+
+local function getDisplayName(uri)
+  local name = nil
+  pcall(function()
+    local cur = ctx.getContentResolver().query(uri, nil, nil, nil, nil)
+    if cur then
+      if cur.moveToFirst() then
+        local idx = cur.getColumnIndex("_display_name")
+        if idx >= 0 then name = cur.getString(idx) end
+      end
+      cur.close()
+    end
+  end)
+  if not name or name == "" then name = "Selected File" end
+  return name
+end
+
+local function getSkipText()
+  return tostring(math.floor(skipDuration / 1000)) .. "s"
+end
+
+local function openUrl(url)
+  pcall(function()
+    local intent = Intent(Intent.ACTION_VIEW)
+    intent.setData(Uri.parse(url))
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    ctx.startActivity(intent)
+  end)
+end
+
+local function openEmail()
+  pcall(function()
+    local intent = Intent(Intent.ACTION_SENDTO)
+    intent.setData(Uri.parse("mailto:" .. APP_EMAIL))
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    ctx.startActivity(intent)
+  end)
+end
+
+-- ============================================================
+--  MAIN LAYOUT
+-- ============================================================
+local mainLayout = LinearLayout(ctx)
+mainLayout.setOrientation(LinearLayout.VERTICAL)
+mainLayout.setLayoutParams(LinearLayout.LayoutParams(
+  LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT))
+mainLayout.setPadding(12, 12, 12, 12)
+mainLayout.setBackgroundColor(0xFFFAFAFA)
+
+local titleView = TextView(ctx)
+titleView.setText(APP_NAME)
+titleView.setTextSize(24)
+titleView.setTextColor(0xFF1E88E5)
+titleView.setGravity(Gravity.CENTER)
+titleView.setTypeface(nil, 1)
+mainLayout.addView(titleView)
+
+local devView = TextView(ctx)
+devView.setText(DEV_NAME)
+devView.setTextSize(12)
+devView.setTextColor(0xFF888888)
+devView.setGravity(Gravity.CENTER)
+devView.setPadding(0, 0, 0, 14)
+mainLayout.addView(devView)
+
+local selectRow = LinearLayout(ctx)
+selectRow.setOrientation(LinearLayout.HORIZONTAL)
+selectRow.setGravity(Gravity.CENTER)
+selectRow.setPadding(0, 0, 0, 10)
+
+local function createSelectBtn(text, color)
+  local b = Button(ctx)
+  b.setText(text)
+  b.setTextColor(0xFFFFFFFF)
+  b.setTextSize(14)
+  b.setBackgroundColor(color)
+  local p = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+  p.setMargins(4, 0, 4, 0)
+  b.setLayoutParams(p)
+  return b
+end
+
+local btnSelectAudio = createSelectBtn("Select Audio", 0xFF43A047)
+selectRow.addView(btnSelectAudio)
+local btnSelectVideo = createSelectBtn("Select Video", 0xFF1E88E5)
+selectRow.addView(btnSelectVideo)
+mainLayout.addView(selectRow)
+
+local mediaArea = LinearLayout(ctx)
+mediaArea.setOrientation(LinearLayout.VERTICAL)
+mediaArea.setLayoutParams(LinearLayout.LayoutParams(
+  LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0))
+mediaArea.setBackgroundColor(0xFF000000)
+
+local audioPlaceholder = LinearLayout(ctx)
+audioPlaceholder.setOrientation(LinearLayout.VERTICAL)
+audioPlaceholder.setGravity(Gravity.CENTER)
+audioPlaceholder.setLayoutParams(LinearLayout.LayoutParams(
+  LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT))
+
+local audioHint = TextView(ctx)
+audioHint.setText("Select an audio or video file to begin")
+audioHint.setTextColor(0xFFCCCCCC)
+audioHint.setTextSize(15)
+audioHint.setGravity(Gravity.CENTER)
+audioHint.setPadding(20, 16, 20, 0)
+audioPlaceholder.addView(audioHint)
+mediaArea.addView(audioPlaceholder)
+
+local videoFrame = FrameLayout(ctx)
+videoFrame.setLayoutParams(LinearLayout.LayoutParams(
+  LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT))
+videoFrame.setVisibility(View.GONE)
+
+local videoView = VideoView(ctx)
+videoView.setLayoutParams(FrameLayout.LayoutParams(
+  FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+videoFrame.addView(videoView)
+mediaArea.addView(videoFrame)
+mainLayout.addView(mediaArea)
+
+local fileInfoView = TextView(ctx)
+fileInfoView.setText("No file selected")
+fileInfoView.setGravity(Gravity.CENTER)
+fileInfoView.setTextSize(13)
+fileInfoView.setTextColor(0xFF333333)
+fileInfoView.setPadding(0, 8, 0, 8)
+mainLayout.addView(fileInfoView)
+
+local seekBarLayout = LinearLayout(ctx)
+seekBarLayout.setOrientation(LinearLayout.HORIZONTAL)
+seekBarLayout.setVisibility(View.GONE)
+
+local timeCurrent = TextView(ctx)
+timeCurrent.setText("00:00")
+timeCurrent.setTextSize(11)
+seekBarLayout.addView(timeCurrent)
+
+local seekBar = SeekBar(ctx)
+seekBar.setLayoutParams(LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0))
+seekBarLayout.addView(seekBar)
+
+local timeTotal = TextView(ctx)
+timeTotal.setText("00:00")
+timeTotal.setTextSize(11)
+seekBarLayout.addView(timeTotal)
+mainLayout.addView(seekBarLayout)
+
+local controlRow = LinearLayout(ctx)
+controlRow.setOrientation(LinearLayout.HORIZONTAL)
+controlRow.setGravity(Gravity.CENTER)
+controlRow.setVisibility(View.GONE)
+controlRow.setPadding(0, 4, 0, 4)
+
+local function createControlBtn(text)
+  local b = Button(ctx)
+  b.setText(text)
+  b.setTextSize(11)
+  b.setPadding(4, 10, 4, 10)
+  local p = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+  p.setMargins(3, 0, 3, 0)
+  b.setLayoutParams(p)
+  return b
+end
+
+local btnRewind    = createControlBtn("Rewind " .. getSkipText())
+local btnPlayPause = createControlBtn("Play")
+local btnForward   = createControlBtn("Forward " .. getSkipText())
+controlRow.addView(btnRewind)
+controlRow.addView(btnPlayPause)
+controlRow.addView(btnForward)
+mainLayout.addView(controlRow)
+
+local speedRow = LinearLayout(ctx)
+speedRow.setOrientation(LinearLayout.HORIZONTAL)
+speedRow.setGravity(Gravity.CENTER_VERTICAL)
+speedRow.setVisibility(View.GONE)
+speedRow.setPadding(0, 4, 0, 4)
+
+local speedLabel = TextView(ctx)
+speedLabel.setText("Playback Speed: ")
+speedLabel.setTextSize(12)
+speedRow.addView(speedLabel)
+
+local speedLabels = {"0.5x", "0.75x", "1x", "1.25x", "1.5x", "2x", "3x", "4x"}
+local speedValues = {0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0}
+
+local speedSpinner = Spinner(ctx)
+local speedAdapter = ArrayAdapter(ctx, android.R.layout.simple_spinner_item, speedLabels)
+speedAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+speedSpinner.setAdapter(speedAdapter)
+local initSpeedIdx = 2
+for i, v in ipairs(speedValues) do
+  if math.abs(v - playbackSpeed) < 0.05 then initSpeedIdx = i - 1; break end
+end
+speedSpinner.setSelection(initSpeedIdx)
+speedRow.addView(speedSpinner)
+mainLayout.addView(speedRow)
+
+local bottomRow = LinearLayout(ctx)
+bottomRow.setOrientation(LinearLayout.HORIZONTAL)
+bottomRow.setGravity(Gravity.CENTER)
+bottomRow.setPadding(0, 8, 0, 0)
+
+local function createBottomBtn(text)
+  local b = Button(ctx)
+  b.setText(text)
+  b.setTextSize(12)
+  local p = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+  p.setMargins(3, 0, 3, 0)
+  b.setLayoutParams(p)
+  return b
+end
+
+local btnSettings = createBottomBtn("Settings")
+local btnAbout    = createBottomBtn("About")
+local btnExit     = createBottomBtn("Exit")
+bottomRow.addView(btnSettings)
+bottomRow.addView(btnAbout)
+bottomRow.addView(btnExit)
+mainLayout.addView(bottomRow)
+
+local mainDialog = nil
+if activity then
+  activity.setContentView(mainLayout)
+else
+  local b = AlertDialog.Builder(ctx)
+  b.setView(mainLayout)
+  mainDialog = showSafeDialog(b)
+end
+
+-- ============================================================
+--  APPLY SPEED
+-- ============================================================
+local function applySpeed()
+  if Build.VERSION.SDK_INT < 23 then return end
+  pcall(function()
+    local PP = luajava.bindClass("android.media.PlaybackParams")
+    local mp
+    if currentFileType == "video" and videoMediaPlayer then mp = videoMediaPlayer
+    elseif currentFileType == "audio" then mp = mediaPlayer end
+    if mp then
+      local p = mp.getPlaybackParams()
+      if not p then p = PP() end
+      p.setSpeed(playbackSpeed)
+      mp.setPlaybackParams(p)
+    end
+  end)
+end
+
+-- ============================================================
+--  LOAD MEDIA  (auto-play on selection)
+-- ============================================================
+local function loadMediaFromUri(uri, mediaType)
+  local displayName = getDisplayName(uri)
+
+  -- stop whatever is currently playing
+  pcall(function() if mediaPlayer.isPlaying() then mediaPlayer.stop() end end)
+  pcall(function() mediaPlayer.reset() end)
+  pcall(function() if videoView.isPlaying() then videoView.stopPlayback() end end)
+
+  currentFileType = mediaType
+  prefs.edit().putString("currentFileType", mediaType).apply()
+
+  fileInfoView.setText((mediaType == "video" and "Video: " or "Audio: ") .. displayName)
+  seekBarLayout.setVisibility(View.VISIBLE)
+  controlRow.setVisibility(View.VISIBLE)
+  speedRow.setVisibility(View.VISIBLE)
+  btnPlayPause.setText("Play")
+  timeCurrent.setText("00:00")
+  timeTotal.setText("00:00")
+  seekBar.setProgress(0)
+
+  if mediaType == "video" then
+    audioPlaceholder.setVisibility(View.GONE)
+    videoFrame.setVisibility(View.VISIBLE)
+    videoView.setVideoURI(uri)
+    videoView.requestFocus()
+
+    videoView.setOnPreparedListener(MediaPlayer.OnPreparedListener{
+      onPrepared = function(mp)
+        videoMediaPlayer = mp
+        mp.setLooping(singleLoop)
+        local dur = videoView.getDuration()
+        if dur > 0 then
+          seekBar.setMax(dur)
+          timeTotal.setText(formatDuration(dur))
+        end
+        videoView.start()
+        btnPlayPause.setText("Pause")
+        applySpeed()
+      end
+    })
+    videoView.setOnCompletionListener(MediaPlayer.OnCompletionListener{
+      onCompletion = function(mp)
+        if singleLoop then
+          videoView.seekTo(0); videoView.start()
+        else
+          btnPlayPause.setText("Play")
+        end
+      end
+    })
+  else
+    videoFrame.setVisibility(View.GONE)
+    audioPlaceholder.setVisibility(View.VISIBLE)
+    audioHint.setText("Playing: " .. displayName)
+
+    pcall(function()
+      mediaPlayer.reset()
+      mediaPlayer.setDataSource(ctx, uri)
+      mediaPlayer.setLooping(singleLoop)
+
+      mediaPlayer.setOnPreparedListener(MediaPlayer.OnPreparedListener{
+        onPrepared = function(mp)
+          local dur = mp.getDuration()
+          if dur > 0 then
+            seekBar.setMax(dur)
+            timeTotal.setText(formatDuration(dur))
+          end
+          mp.start()
+          btnPlayPause.setText("Pause")
+          applySpeed()
+        end
+      })
+
+      mediaPlayer.setOnCompletionListener(MediaPlayer.OnCompletionListener{
+        onCompletion = function(mp)
+          if singleLoop then
+            pcall(function() mp.seekTo(0); mp.start() end)
+          else
+            btnPlayPause.setText("Play")
+          end
+        end
+      })
+
+      mediaPlayer.prepareAsync()
+    end)
+  end
+end
+_G.loadMediaFromUri = loadMediaFromUri
+
+-- ============================================================
+--  FILE PICKER RESULT
+-- ============================================================
+function onActivityResult(reqCode, resCode, data)
+  if reqCode == 1001 then
+    if resCode == -1 and data then
+      local uri = data.getData()
+      if uri and _G.pendingSelectionType and _G.loadMediaFromUri then
+        _G.loadMediaFromUri(uri, _G.pendingSelectionType)
+      else
+        Toast.makeText(_G.ctx or ctx, "Could not read selected file", Toast.LENGTH_SHORT).show()
+      end
+    end
+    _G.pendingSelectionType = nil
+  end
+end
+
+local function pickFile(mediaType)
+  if not activity then
+    Toast.makeText(ctx, "File picker requires an activity context", Toast.LENGTH_SHORT).show()
+    return
+  end
+  _G.pendingSelectionType = mediaType
+  local intent = Intent(Intent.ACTION_GET_CONTENT)
+  intent.setType(mediaType == "video" and "video/*" or "audio/*")
+  intent.addCategory(Intent.CATEGORY_OPENABLE)
+  intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+  activity.startActivityForResult(intent, 1001)
+end
+
+btnSelectAudio.setOnClickListener(View.OnClickListener{
+  onClick = function(v) pickFile("audio") end
+})
+btnSelectVideo.setOnClickListener(View.OnClickListener{
+  onClick = function(v) pickFile("video") end
+})
+
+-- ============================================================
+--  PLAY / PAUSE
+-- ============================================================
+btnPlayPause.setOnClickListener(View.OnClickListener{
+  onClick = function(v)
+    if currentFileType == "video" then
+      if videoView.isPlaying() then
+        videoView.pause(); btnPlayPause.setText("Play")
+      else
+        videoView.start(); btnPlayPause.setText("Pause"); applySpeed()
+      end
+    else
+      pcall(function()
+        if mediaPlayer.isPlaying() then
+          mediaPlayer.pause(); btnPlayPause.setText("Play")
+        else
+          mediaPlayer.start(); btnPlayPause.setText("Pause"); applySpeed()
+        end
+      end)
+    end
+  end
+})
+
+-- ============================================================
+--  REWIND / FORWARD
+-- ============================================================
+btnRewind.setOnClickListener(View.OnClickListener{
+  onClick = function(v)
+    if currentFileType == "video" then
+      videoView.seekTo(math.max(0, videoView.getCurrentPosition() - skipDuration))
+    else
+      pcall(function()
+        mediaPlayer.seekTo(math.max(0, mediaPlayer.getCurrentPosition() - skipDuration))
+      end)
+    end
+  end
+})
+
+btnForward.setOnClickListener(View.OnClickListener{
+  onClick = function(v)
+    if currentFileType == "video" then
+      videoView.seekTo(math.min(videoView.getDuration(), videoView.getCurrentPosition() + skipDuration))
+    else
+      pcall(function()
+        mediaPlayer.seekTo(math.min(mediaPlayer.getDuration(), mediaPlayer.getCurrentPosition() + skipDuration))
+      end)
+    end
+  end
+})
+
+-- ============================================================
+--  SEEKBAR UPDATE LOOP
+-- ============================================================
+local updH = Handler(Looper.getMainLooper())
+local updR
+updR = Runnable{
+  run = function()
+    pcall(function()
+      if currentFileType == "video" and videoView.isPlaying() then
+        local cur, dur = videoView.getCurrentPosition(), videoView.getDuration()
+        seekBar.setMax(dur); seekBar.setProgress(cur)
+        timeCurrent.setText(formatDuration(cur)); timeTotal.setText(formatDuration(dur))
+      elseif currentFileType == "audio" and mediaPlayer.isPlaying() then
+        local cur, dur = mediaPlayer.getCurrentPosition(), mediaPlayer.getDuration()
+        seekBar.setMax(dur); seekBar.setProgress(cur)
+        timeCurrent.setText(formatDuration(cur)); timeTotal.setText(formatDuration(dur))
+      end
+    end)
+    updH.postDelayed(updR, 1000)
+  end
+}
+updH.postDelayed(updR, 1000)
+
+-- ============================================================
+--  SEEKBAR LISTENER
+-- ============================================================
+seekBar.setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener{
+  onProgressChanged = function(sb, progress, fromUser)
+    if fromUser then
+      if currentFileType == "video" then videoView.seekTo(progress)
+      else pcall(function() mediaPlayer.seekTo(progress) end) end
+      timeCurrent.setText(formatDuration(progress))
+    end
+  end,
+  onStartTrackingTouch = function(sb) end,
+  onStopTrackingTouch  = function(sb) end
+})
+
+-- ============================================================
+--  SPEED SPINNER
+-- ============================================================
+speedSpinner.setOnItemSelectedListener(AdapterView.OnItemSelectedListener{
+  onItemSelected = function(p, v, pos, id)
+    playbackSpeed = speedValues[pos + 1] or 1.0
+    prefs.edit().putFloat("playbackSpeed", playbackSpeed).apply()
+    applySpeed()
+  end,
+  onNothingSelected = function(p) end
+})
+
+-- ============================================================
+--  SETTINGS
+-- ============================================================
+btnSettings.setOnClickListener(View.OnClickListener{
+  onClick = function(v)
+    local dlg = AlertDialog.Builder(ctx)
+    dlg.setTitle("Settings")
+
+    local lay = LinearLayout(ctx)
+    lay.setOrientation(LinearLayout.VERTICAL)
+    lay.setPadding(30, 20, 30, 20)
+
+    local lbl1 = TextView(ctx); lbl1.setText("Skip Duration (Rewind / Forward):")
+    lay.addView(lbl1)
+
+    local timeSp = Spinner(ctx)
+    local timeTxt = {"5 seconds", "10 seconds", "15 seconds", "20 seconds", "30 seconds", "60 seconds"}
+    local timeVal = {5000, 10000, 15000, 20000, 30000, 60000}
+    timeSp.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_spinner_item, timeTxt))
+    for i, val in ipairs(timeVal) do
+      if val == skipDuration then timeSp.setSelection(i - 1); break end
+    end
+    lay.addView(timeSp)
+
+    local lbl2 = TextView(ctx); lbl2.setText("Default Playback Speed:")
+    lbl2.setPadding(0, 15, 0, 0)
+    lay.addView(lbl2)
+
+    local defSpeedSp = Spinner(ctx)
+    defSpeedSp.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_spinner_item, speedLabels))
+    for i, val in ipairs(speedValues) do
+      if math.abs(val - playbackSpeed) < 0.05 then defSpeedSp.setSelection(i - 1); break end
+    end
+    lay.addView(defSpeedSp)
+
+    local chkLoop = CheckBox(ctx)
+    chkLoop.setText("Loop Current File")
+    chkLoop.setChecked(singleLoop)
+    chkLoop.setPadding(0, 15, 0, 8)
+    lay.addView(chkLoop)
+
+    local chkBg = CheckBox(ctx)
+    chkBg.setText("Background Play")
+    chkBg.setChecked(backgroundPlay)
+    chkBg.setPadding(0, 8, 0, 15)
+    lay.addView(chkBg)
+
+    dlg.setView(lay)
+
+    dlg.setPositiveButton("Save", DialogInterface.OnClickListener{
+      onClick = function(d, w)
+        skipDuration   = timeVal[timeSp.getSelectedItemPosition() + 1] or 10000
+        playbackSpeed  = speedValues[defSpeedSp.getSelectedItemPosition() + 1] or 1.0
+        singleLoop     = chkLoop.isChecked()
+        backgroundPlay = chkBg.isChecked()
+
+        prefs.edit()
+          .putInt("skipDuration", skipDuration)
+          .putFloat("playbackSpeed", playbackSpeed)
+          .putBoolean("singleLoop", singleLoop)
+          .putBoolean("backgroundPlay", backgroundPlay)
+          .apply()
+
+        btnRewind.setText("Rewind " .. getSkipText())
+        btnForward.setText("Forward " .. getSkipText())
+
+        for i, val in ipairs(speedValues) do
+          if math.abs(val - playbackSpeed) < 0.05 then speedSpinner.setSelection(i - 1); break end
+        end
+
+        pcall(function()
+          mediaPlayer.setLooping(singleLoop)
+          if videoMediaPlayer then videoMediaPlayer.setLooping(singleLoop) end
+        end)
+        applySpeed()
+
+        Toast.makeText(ctx, "Settings saved", Toast.LENGTH_SHORT).show()
+      end
+    })
+
+    dlg.setNegativeButton("Cancel", nil)
+    showSafeDialog(dlg)
+  end
+})
+
+-- ============================================================
+--  ABOUT + SEND FEEDBACK (single dialog, view swap)
+-- ============================================================
+btnAbout.setOnClickListener(View.OnClickListener{
+  onClick = function(v)
+    local ok, err = pcall(function()
+      local dm   = ctx.getResources().getDisplayMetrics()
+      local dlgW = math.floor(dm.widthPixels * 0.94)
+      local dlgH = math.floor(dm.heightPixels * 0.85)
+
+      local dialog = Dialog(ctx)
+      dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+      dialog.setCanceledOnTouchOutside(false)
+
+      local container = FrameLayout(ctx)
+      dialog.setContentView(container)
+
+      local showFeedbackPage
+      local showAboutPage
+
+      -- ---------------- ABOUT PAGE ----------------
+      showAboutPage = function()
+        container.removeAllViews()
+
+        local page = LinearLayout(ctx)
+        page.setOrientation(LinearLayout.VERTICAL)
+        page.setBackgroundColor(0xFFFFFFFF)
+
+        local headerLay = LinearLayout(ctx)
+        headerLay.setOrientation(LinearLayout.VERTICAL)
+        headerLay.setPadding(24, 16, 24, 6)
+
+        local nameTV = TextView(ctx)
+        nameTV.setText(APP_NAME)
+        nameTV.setTextSize(22)
+        nameTV.setTypeface(nil, 1)
+        nameTV.setTextColor(0xFF1E88E5)
+        nameTV.setGravity(Gravity.CENTER)
+        headerLay.addView(nameTV)
+
+        local verTV = TextView(ctx)
+        verTV.setText("Version " .. APP_VERSION)
+        verTV.setTextSize(12)
+        verTV.setTextColor(0xFF888888)
+        verTV.setGravity(Gravity.CENTER)
+        verTV.setPadding(0, 2, 0, 8)
+        headerLay.addView(verTV)
+
+        local devTV = TextView(ctx)
+        devTV.setText(DEV_NAME)
+        devTV.setTextSize(13)
+        devTV.setGravity(Gravity.CENTER)
+        headerLay.addView(devTV)
+
+        local createdTV = TextView(ctx)
+        createdTV.setText(CREATED_BY)
+        createdTV.setTextSize(13)
+        createdTV.setGravity(Gravity.CENTER)
+        createdTV.setPadding(0, 4, 0, 6)
+        headerLay.addView(createdTV)
+
+        page.addView(headerLay)
+
+        local scroll = ScrollView(ctx)
+        scroll.setLayoutParams(LinearLayout.LayoutParams(
+          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0))
+
+        local lay = LinearLayout(ctx)
+        lay.setOrientation(LinearLayout.VERTICAL)
+        lay.setPadding(24, 4, 24, 8)
+        scroll.addView(lay)
+
+        local descHead = TextView(ctx)
+        descHead.setText("Description")
+        descHead.setTextSize(16)
+        descHead.setTypeface(nil, 1)
+        descHead.setTextColor(0xFF1E88E5)
+        descHead.setPadding(0, 8, 0, 6)
+        lay.addView(descHead)
+
+        local descTV = TextView(ctx)
+        descTV.setText(APP_DESCRIPTION)
+        descTV.setTextSize(13)
+        descTV.setTextColor(0xFF333333)
+        descTV.setPadding(0, 0, 0, 12)
+        lay.addView(descTV)
+
+        local contactHead = TextView(ctx)
+        contactHead.setText("Contact us")
+        contactHead.setTextSize(16)
+        contactHead.setTypeface(nil, 1)
+        contactHead.setTextColor(0xFF1E88E5)
+        contactHead.setPadding(0, 8, 0, 6)
+        lay.addView(contactHead)
+
+        local waCh = Button(ctx)
+        waCh.setText("WhatsApp Channel")
+        waCh.setLayoutParams(LinearLayout.LayoutParams(
+          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        waCh.setOnClickListener(View.OnClickListener{
+          onClick = function() openUrl(WA_CHANNEL_URL) end
+        })
+        lay.addView(waCh)
+
+        local waCm = Button(ctx)
+        waCm.setText("WhatsApp Community")
+        waCm.setLayoutParams(LinearLayout.LayoutParams(
+          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        waCm.setOnClickListener(View.OnClickListener{
+          onClick = function() openUrl(WA_COMMUNITY_URL) end
+        })
+        lay.addView(waCm)
+
+        local ytBtn = Button(ctx)
+        ytBtn.setText("YouTube Channel")
+        ytBtn.setLayoutParams(LinearLayout.LayoutParams(
+          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        ytBtn.setOnClickListener(View.OnClickListener{
+          onClick = function() openUrl(YOUTUBE_URL) end
+        })
+        lay.addView(ytBtn)
+
+        local emailTV = TextView(ctx)
+        emailTV.setText("Email: " .. APP_EMAIL)
+        emailTV.setTextSize(13)
+        emailTV.setTextColor(0xFF1E88E5)
+        emailTV.setPadding(0, 10, 0, 10)
+        emailTV.setOnClickListener(View.OnClickListener{
+          onClick = function() openEmail() end
+        })
+        lay.addView(emailTV)
+
+        page.addView(scroll)
+
+        -- footer: [Send Feedback]  [Close]   <-- order fixed
+        local footer = LinearLayout(ctx)
+        footer.setOrientation(LinearLayout.HORIZONTAL)
+        footer.setPadding(16, 6, 16, 12)
+
+        local fbBtn = Button(ctx)
+        fbBtn.setText("Send Feedback")
+        local lp1 = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+        lp1.setMargins(4, 0, 4, 0)
+        fbBtn.setLayoutParams(lp1)
+        footer.addView(fbBtn)
+
+        local closeBtn = Button(ctx)
+        closeBtn.setText("Close")
+        local lp2 = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+        lp2.setMargins(4, 0, 4, 0)
+        closeBtn.setLayoutParams(lp2)
+        footer.addView(closeBtn)
+
+        page.addView(footer)
+        container.addView(page)
+
+        closeBtn.setOnClickListener(View.OnClickListener{
+          onClick = function() dialog.dismiss() end
+        })
+
+        fbBtn.setOnClickListener(View.OnClickListener{
+          onClick = function()
+            local okFb, errFb = pcall(showFeedbackPage)
+            if not okFb then
+              pcall(function()
+                Toast.makeText(ctx, "Feedback error: " .. tostring(errFb), Toast.LENGTH_LONG).show()
+              end)
+            end
+          end
+        })
+      end
+
+      -- ---------------- FEEDBACK PAGE ----------------
+      showFeedbackPage = function()
+        container.removeAllViews()
+
+        local page = LinearLayout(ctx)
+        page.setOrientation(LinearLayout.VERTICAL)
+        page.setBackgroundColor(0xFFFFFFFF)
+        page.setPadding(24, 16, 24, 12)
+
+        local titleTV = TextView(ctx)
+        titleTV.setText("Send Feedback")
+        titleTV.setTextSize(18)
+        titleTV.setTypeface(nil, 1)
+        titleTV.setTextColor(0xFF1E88E5)
+        titleTV.setPadding(0, 0, 0, 10)
+        page.addView(titleTV)
+
+        local scroll = ScrollView(ctx)
+        scroll.setLayoutParams(LinearLayout.LayoutParams(
+          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0))
+
+        local inner = LinearLayout(ctx)
+        inner.setOrientation(LinearLayout.VERTICAL)
+        scroll.addView(inner)
+
+        local nameLabel = TextView(ctx)
+        nameLabel.setText("Name")
+        inner.addView(nameLabel)
+
+        local nameInput = EditText(ctx)
+        nameInput.setHint("Enter your name")
+        inner.addView(nameInput)
+
+        local phoneLabel = TextView(ctx)
+        phoneLabel.setText("Phone / WhatsApp Number (with country code)")
+        phoneLabel.setPadding(0, 12, 0, 0)
+        inner.addView(phoneLabel)
+
+        local phoneInput = EditText(ctx)
+        phoneInput.setHint("+92 300 0000000")
+        -- TYPE_CLASS_PHONE = 3 (numeric constant, safest way)
+        pcall(function() phoneInput.setInputType(3) end)
+        inner.addView(phoneInput)
+
+        local fbLabel = TextView(ctx)
+        fbLabel.setText("Write Feedback")
+        fbLabel.setPadding(0, 12, 0, 0)
+        inner.addView(fbLabel)
+
+        local fbInput = EditText(ctx)
+        fbInput.setHint("Write your feedback here...")
+        fbInput.setMinLines(4)
+        fbInput.setGravity(Gravity.TOP)
+        inner.addView(fbInput)
+
+        page.addView(scroll)
+
+        local footer = LinearLayout(ctx)
+        footer.setOrientation(LinearLayout.HORIZONTAL)
+        footer.setPadding(0, 8, 0, 0)
+
+        local backBtn = Button(ctx)
+        backBtn.setText("Back")
+        local blp1 = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+        blp1.setMargins(2, 0, 2, 0)
+        backBtn.setLayoutParams(blp1)
+        footer.addView(backBtn)
+
+        local sendBtn = Button(ctx)
+        sendBtn.setText("Send")
+        local blp2 = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0)
+        blp2.setMargins(2, 0, 2, 0)
+        sendBtn.setLayoutParams(blp2)
+        footer.addView(sendBtn)
+
+        page.addView(footer)
+        container.addView(page)
+
+        backBtn.setOnClickListener(View.OnClickListener{
+          onClick = function()
+            pcall(showAboutPage)
+          end
+        })
+
+        sendBtn.setOnClickListener(View.OnClickListener{
+          onClick = function()
+            local nm = nameInput.getText().toString()
+            local ph = phoneInput.getText().toString()
+            local fb = fbInput.getText().toString()
+            if nm == "" or fb == "" then
+              Toast.makeText(ctx, "Please enter your name and feedback", Toast.LENGTH_SHORT).show()
+              return
+            end
+            local msg = "Name: " .. nm .. "\nPhone: " .. ph .. "\n\nFeedback:\n" .. fb
+            local encoded = msg
+            pcall(function()
+              local URLEncoder = luajava.bindClass("java.net.URLEncoder")
+              encoded = URLEncoder.encode(msg, "UTF-8")
+            end)
+            local url = "https://wa.me/" .. FEEDBACK_NUMBER .. "?text=" .. encoded
+            local okOpen = pcall(function()
+              local intent = Intent(Intent.ACTION_VIEW)
+              intent.setData(Uri.parse(url))
+              intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+              ctx.startActivity(intent)
+            end)
+            if okOpen then
+              pcall(function() dialog.dismiss() end)
+            else
+              Toast.makeText(ctx, "Unable to open WhatsApp", Toast.LENGTH_SHORT).show()
+            end
+          end
+        })
+      end
+
+      -- show the About page first
+      showAboutPage()
+
+      if not activity then
+        pcall(function()
+          local wt = WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+          if Build.VERSION.SDK_INT >= 26 then wt = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY end
+          dialog.getWindow().setType(wt)
+        end)
+      end
+
+      dialog.show()
+      pcall(function()
+        local lp = dialog.getWindow().getAttributes()
+        lp.width = dlgW
+        lp.height = dlgH
+        dialog.getWindow().setAttributes(lp)
+      end)
+    end)
+
+    if not ok then
+      pcall(function()
+        Toast.makeText(ctx, "About error: " .. tostring(err), Toast.LENGTH_LONG).show()
+      end)
+    end
+  end
+})
+
+-- ============================================================
+--  EXIT
+-- ============================================================
+btnExit.setOnClickListener(View.OnClickListener{
+  onClick = function(v)
+    if not backgroundPlay then
+      pcall(function()
+        if mediaPlayer.isPlaying() then mediaPlayer.stop() end
+        mediaPlayer.reset()
+      end)
+      pcall(function()
+        if videoView.isPlaying() then videoView.stopPlayback() end
+      end)
+    end
+
+    if mainDialog then mainDialog.dismiss()
+    elseif activity then activity.finish() end
+  end
+})
